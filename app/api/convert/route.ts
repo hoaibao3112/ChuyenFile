@@ -1,20 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 
-// ✅ CJK-safe PDF text extraction using pdfjs-dist (Mozilla PDF.js engine)
-// Đảm bảo trích xuất chính xác 100% tiếng Trung, tiếng Nhật, tiếng Hàn và tiếng Việt có dấu.
+// ✅ CJK-Safe PDF to Formatted Excel Table Converter
+// Bảo tồn 100% font tiếng Trung / Nhật / Hàn / Việt và tạo bảng Excel chuẩn có viền kẻ (Borders)
 
 export const maxDuration = 60;
 
-interface ExtractedTable {
-  headers: string[];
-  rows: string[][];
-  pageNumber: number;
-}
-
-interface PdfTextItem {
+interface PdfItem {
   str: string;
   x: number;
   y: number;
@@ -22,39 +16,9 @@ interface PdfTextItem {
   h: number;
 }
 
-// Thuật toán gom text theo dòng và sắp xếp các cột theo tọa độ X
-function groupItemsIntoRows(items: PdfTextItem[]): string[][] {
-  if (items.length === 0) return [];
-
-  // Sắp xếp: Y giảm dần (từ trên xuống dưới), sau đó X tăng dần (từ trái sang phải)
-  const sorted = [...items].sort((a, b) => {
-    const yDiff = b.y - a.y;
-    if (Math.abs(yDiff) > 4) return yDiff;
-    return a.x - b.x;
-  });
-
-  const lines: PdfTextItem[][] = [];
-  let currentLine: PdfTextItem[] = [];
-  let currentY = sorted[0]?.y ?? 0;
-
-  for (const item of sorted) {
-    if (Math.abs(item.y - currentY) > 4) {
-      if (currentLine.length > 0) {
-        lines.push(currentLine);
-      }
-      currentLine = [item];
-      currentY = item.y;
-    } else {
-      currentLine.push(item);
-    }
-  }
-
-  if (currentLine.length > 0) {
-    lines.push(currentLine);
-  }
-
-  // Chuyển đổi từng dòng thành mảng chuỗi
-  return lines.map((line) => line.map((item) => item.str));
+interface TextLine {
+  y: number;
+  items: PdfItem[];
 }
 
 export async function POST(req: NextRequest) {
@@ -82,7 +46,7 @@ export async function POST(req: NextRequest) {
     const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
     const fs = await import('node:fs');
 
-    // Cấu hình workerSrc: ưu tiên local file, tự động fallback sang CDN khi deploy Vercel Serverless
+    // Cấu hình worker: local file hoặc CDN fallback trên Vercel Serverless
     try {
       const workerPath = path.resolve(process.cwd(), 'node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs');
       if (fs.existsSync(workerPath)) {
@@ -94,7 +58,7 @@ export async function POST(req: NextRequest) {
       pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/legacy/build/pdf.worker.min.mjs`;
     }
 
-    // Load PDF document với font CJK đầy đủ
+    // Load PDF document
     const loadingTask = pdfjsLib.getDocument({
       data: uint8Array,
       useSystemFonts: true,
@@ -104,92 +68,209 @@ export async function POST(req: NextRequest) {
     const pdfDoc = await loadingTask.promise;
     const numPages = pdfDoc.numPages;
 
-    const allTables: ExtractedTable[] = [];
-    const allRawRows: string[][] = [];
+    // Khởi tạo ExcelJS Workbook
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'PDF to Excel CJK Converter';
+    workbook.created = new Date();
 
-    // Duyệt qua từng trang của tài liệu PDF
+    let totalRowsProcessed = 0;
+
+    // Duyệt qua từng trang
     for (let pageNum = 1; pageNum <= numPages; pageNum++) {
       const page = await pdfDoc.getPage(pageNum);
-      const textContent = await page.getTextContent({
-        includeMarkedContent: false,
-      });
+      const textContent = await page.getTextContent({ includeMarkedContent: false });
 
-      // Lọc các ký tự hợp lệ và lấy tọa độ x, y
-      const textItems: PdfTextItem[] = (textContent.items as any[])
-        .filter((item) => typeof item?.str === 'string' && item.str.trim() !== '')
-        .map((item) => ({
-          str: item.str.trim(),
-          x: item.transform ? item.transform[4] : 0,
-          y: item.transform ? item.transform[5] : 0,
-          w: item.width || 0,
-          h: item.height || 0,
+      // Lọc các item hợp lệ
+      const items: PdfItem[] = (textContent.items as any[])
+        .filter((it) => typeof it?.str === 'string' && it.str.trim() !== '')
+        .map((it) => ({
+          str: it.str.trim(),
+          x: it.transform ? it.transform[4] : 0,
+          y: it.transform ? it.transform[5] : 0,
+          w: it.width || 0,
+          h: it.height || 0,
         }));
 
-      if (textItems.length === 0) continue;
+      if (items.length === 0) continue;
 
-      const pageRows = groupItemsIntoRows(textItems);
+      // Sắp xếp tọa độ: Y giảm dần (từ trên xuống dưới), X tăng dần (từ trái sang phải)
+      items.sort((a, b) => {
+        const yDiff = b.y - a.y;
+        if (Math.abs(yDiff) > 4) return yDiff;
+        return a.x - b.x;
+      });
 
-      if (pageRows.length > 0) {
-        allTables.push({
-          headers: pageRows[0] || [],
-          rows: pageRows.slice(1),
-          pageNumber: pageNum,
-        });
+      // Nhóm các item theo từng dòng tọa độ Y
+      const lines: TextLine[] = [];
+      let curLineItems: PdfItem[] = [];
+      let curY = items[0]?.y ?? 0;
 
-        allRawRows.push(...pageRows);
+      for (const it of items) {
+        if (Math.abs(it.y - curY) > 4) {
+          if (curLineItems.length > 0) {
+            lines.push({ y: curY, items: curLineItems });
+          }
+          curLineItems = [it];
+          curY = it.y;
+        } else {
+          curLineItems.push(it);
+        }
       }
+      if (curLineItems.length > 0) {
+        lines.push({ y: curY, items: curLineItems });
+      }
+
+      totalRowsProcessed += lines.length;
+
+      // ─── THUẬT TOÁN NHẬN DIỆN BẢNG (TABLE DETECTION) ───
+      // Tìm dòng có nhiều cột nhất (Header tiềm năng của bảng)
+      let bestHeaderIdx = -1;
+      let maxCols = 0;
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].items.length > maxCols && lines[i].items.length >= 3) {
+          maxCols = lines[i].items.length;
+          bestHeaderIdx = i;
+        }
+      }
+
+      // Xây dựng các mốc dải cột (Column Slots) dựa vào Header
+      let columnSlots: { str: string; x: number }[] = [];
+      if (bestHeaderIdx !== -1) {
+        columnSlots = [...lines[bestHeaderIdx].items].sort((a, b) => a.x - b.x);
+      }
+
+      // Hàm xác định vị trí cột theo tọa độ X
+      const getColumnIndex = (x: number): number => {
+        if (columnSlots.length === 0) return 0;
+        for (let i = 0; i < columnSlots.length; i++) {
+          const nextX = i < columnSlots.length - 1 ? columnSlots[i + 1].x - 6 : 99999;
+          const prevX = i === 0 ? 0 : columnSlots[i].x - 12;
+          if (x >= prevX && x < nextX) {
+            return i;
+          }
+        }
+        return columnSlots.length - 1;
+      };
+
+      // Tạo Sheet trong Excel cho trang này
+      const sheetName = numPages === 1 ? 'DuLieuChuyenDoi' : `Trang_${pageNum}`;
+      const worksheet = workbook.addWorksheet(sheetName);
+
+      // Bật hiển thị đường kẻ lưới (Grid lines)
+      worksheet.views = [{ showGridLines: true }];
+
+      // Tìm phạm vi các dòng thuộc bảng
+      const isTableSection = (idx: number): boolean => {
+        if (bestHeaderIdx === -1) return false;
+        // Từ dòng header đến các dòng bên dưới có cấu trúc cột tương ứng
+        return idx >= bestHeaderIdx && idx <= bestHeaderIdx + 25;
+      };
+
+      // Duyệt qua từng dòng và ghi vào worksheet với định dạng bảng
+      lines.forEach((line, lineIdx) => {
+        const rowCells: string[] = [];
+
+        if (columnSlots.length > 0 && isTableSection(lineIdx)) {
+          // Dòng trong khu vực bảng: Map chính xác vào từng cột
+          line.items.forEach((item) => {
+            const colIdx = getColumnIndex(item.x);
+            if (rowCells[colIdx]) {
+              rowCells[colIdx] += ' ' + item.str;
+            } else {
+              rowCells[colIdx] = item.str;
+            }
+          });
+        } else {
+          // Dòng thông tin ngoài bảng (Tiêu đề, khách hàng, ngày tháng, ...)
+          line.items.forEach((item, idx) => {
+            rowCells[idx] = item.str;
+          });
+        }
+
+        // Thêm dòng vào Excel (lấp đầy các ô trống bằng chuỗi rỗng)
+        const filledCells = Array.from({ length: Math.max(rowCells.length, columnSlots.length) }, (_, i) => rowCells[i] ?? '');
+        const addedRow = worksheet.addRow(filledCells);
+
+        // ─── STYLING BẢNG BIỂU CHUYÊN NGHIỆP ───
+        if (lineIdx === bestHeaderIdx && columnSlots.length > 0) {
+          // 👉 DÒNG TIÊU ĐỀ BẢNG (HEADER ROW):
+          addedRow.height = 24;
+          addedRow.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+            if (colNumber <= columnSlots.length) {
+              cell.font = { name: 'Microsoft YaHei', bold: true, color: { argb: 'FF0F172A' }, size: 10 };
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFF1F5F9' }, // Màu nền xám xanh nhạt sang trọng
+              };
+              cell.border = {
+                top: { style: 'medium', color: { argb: 'FF475569' } },
+                left: { style: 'thin', color: { argb: 'FF94A3B8' } },
+                bottom: { style: 'medium', color: { argb: 'FF475569' } },
+                right: { style: 'thin', color: { argb: 'FF94A3B8' } },
+              };
+              cell.alignment = { vertical: 'middle', horizontal: 'center' };
+            }
+          });
+        } else if (bestHeaderIdx !== -1 && lineIdx > bestHeaderIdx && isTableSection(lineIdx)) {
+          // 👉 CÁC DÒNG DỮ LIỆU CỦA BẢNG (DATA ROWS): ĐÓNG KHUNG VIỀN ĐẦY ĐỦ
+          addedRow.height = 20;
+          addedRow.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+            if (colNumber <= columnSlots.length) {
+              cell.font = { name: 'Microsoft YaHei', size: 10, color: { argb: 'FF334155' } };
+              cell.border = {
+                top: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+                left: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+                bottom: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+                right: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+              };
+
+              // Căn lề thông minh theo kiểu dữ liệu
+              const val = String(cell.value || '').trim();
+              if (val !== '' && !isNaN(Number(val)) && val.length < 12) {
+                // Số hoặc số tiền -> Căn lề phải
+                cell.alignment = { vertical: 'middle', horizontal: 'right' };
+              } else if (colNumber === 1 && val.length <= 4) {
+                // Cột STT -> Căn giữa
+                cell.alignment = { vertical: 'middle', horizontal: 'center' };
+              } else {
+                // Văn bản -> Căn lề trái
+                cell.alignment = { vertical: 'middle', horizontal: 'left' };
+              }
+            }
+          });
+        } else {
+          // Các dòng thông tin bên ngoài bảng
+          addedRow.eachCell({ includeEmpty: false }, (cell) => {
+            cell.font = { name: 'Microsoft YaHei', size: 10 };
+            cell.alignment = { vertical: 'middle', horizontal: 'left' };
+          });
+        }
+      });
+
+      // ─── TỰ ĐỘNG ĐIỀU CHỈNH ĐỘ RỘNG CỘT TỐI ƯU CJK ───
+      worksheet.columns.forEach((col) => {
+        let maxLen = 10;
+        col.eachCell?.({ includeEmpty: false }, (cell) => {
+          const str = String(cell.value || '');
+          // Ký tự CJK rộng gấp đôi ký tự Latin
+          const visualLen = [...str].reduce((acc, c) => acc + (c.charCodeAt(0) > 127 ? 2 : 1), 0);
+          if (visualLen > maxLen) maxLen = visualLen;
+        });
+        col.width = Math.min(Math.max(maxLen + 3, 10), 45);
+      });
     }
 
-    if (allRawRows.length === 0) {
+    if (totalRowsProcessed === 0) {
       return NextResponse.json(
         { error: 'Không thể đọc nội dung từ file PDF. File có thể là ảnh scan thuần (cần tính năng OCR).' },
         { status: 422 }
       );
     }
 
-    // Tạo file Excel bằng xlsx
-    const workbook = XLSX.utils.book_new();
-
-    // Sheet tổng hợp toàn bộ nội dung
-    const worksheet = XLSX.utils.aoa_to_sheet(allRawRows);
-
-    // Tự động tính độ rộng cột tối ưu cho tiếng CJK (chữ Hán/Nôm/Hangul/Kana rộng gấp đôi chữ Latin)
-    const range = XLSX.utils.decode_range(worksheet['!ref'] ?? 'A1');
-    const colWidths = [];
-
-    for (let c = 0; c <= range.e.c; c++) {
-      let maxWidth = 12;
-      for (let r = range.s.r; r <= range.e.r; r++) {
-        const cell = worksheet[XLSX.utils.encode_cell({ r, c })];
-        if (cell && cell.v) {
-          const valStr = String(cell.v);
-          const visualLen = [...valStr].reduce((acc, char) => {
-            return acc + (char.charCodeAt(0) > 127 ? 2 : 1);
-          }, 0);
-          maxWidth = Math.max(maxWidth, visualLen + 3);
-        }
-      }
-      colWidths.push({ wch: Math.min(maxWidth, 60) });
-    }
-    worksheet['!cols'] = colWidths;
-
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'TongHop');
-
-    // Nếu PDF có nhiều trang, tạo thêm các tab sheet riêng cho từng trang
-    if (numPages > 1) {
-      for (const table of allTables) {
-        const pageData = [table.headers, ...table.rows];
-        const pageWs = XLSX.utils.aoa_to_sheet(pageData);
-        XLSX.utils.book_append_sheet(workbook, pageWs, `Trang_${table.pageNumber}`);
-      }
-    }
-
-    // Xuất ra Excel Buffer chuẩn
-    const excelBuffer = XLSX.write(workbook, {
-      bookType: 'xlsx',
-      type: 'buffer',
-      compression: true,
-    });
+    // Xuất ra Excel Buffer chuẩn bằng ExcelJS
+    const buffer = await workbook.xlsx.writeBuffer();
+    const excelBuffer = Buffer.from(buffer);
 
     const originalName = file.name.replace(/\.pdf$/i, '');
     const outputFileName = `${originalName}_chuyen_doi.xlsx`;
@@ -201,7 +282,7 @@ export async function POST(req: NextRequest) {
         'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(outputFileName)}`,
         'Content-Length': String(excelBuffer.length),
         'X-Pages-Processed': String(numPages),
-        'X-Rows-Extracted': String(allRawRows.length),
+        'X-Rows-Extracted': String(totalRowsProcessed),
       },
     });
   } catch (error) {
